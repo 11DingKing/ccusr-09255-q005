@@ -9,13 +9,19 @@ from sqlalchemy.ext.asyncio import AsyncEngine, AsyncSession, async_sessionmaker
 from spe.config import Settings, get_settings
 from spe.domain.clock import Clock, SystemClock
 from spe.domain.ids import IdGenerator, UuidGenerator
+from spe.domain.services.appeal_service import AppealService
 from spe.domain.services.policy_service import PolicyService
 from spe.domain.services.session_service import SessionService
 from spe.infra.db.repositories.repositories import (
+    SqlAppealCaseRepository,
+    SqlAppealEventRepository,
+    SqlAppealEvidenceRepository,
     SqlDailyUsageLedger,
+    SqlExceptionGrantRepository,
     SqlHeartbeatRepository,
     SqlOutboxRepository,
     SqlPolicyRepository,
+    SqlProfileCorrectionRepository,
     SqlSessionRepository,
 )
 from spe.infra.db.session import make_engine, make_session_factory
@@ -27,6 +33,7 @@ class Services:
 
     policy_service: PolicyService
     session_service: SessionService
+    appeal_service: AppealService
     heartbeats: SqlHeartbeatRepository
     policies: SqlPolicyRepository
     ledger: SqlDailyUsageLedger
@@ -60,6 +67,11 @@ class Container:
         outbox = SqlOutboxRepository(db)
         heartbeats = SqlHeartbeatRepository(db)
         ledger = SqlDailyUsageLedger(db)
+        cases = SqlAppealCaseRepository(db)
+        evidence = SqlAppealEvidenceRepository(db)
+        case_events = SqlAppealEventRepository(db)
+        exceptions = SqlExceptionGrantRepository(db)
+        corrections = SqlProfileCorrectionRepository(db)
         policy_service = PolicyService(policies, outbox, self.clock, self.ids)
         session_service = SessionService(
             sessions,
@@ -70,10 +82,26 @@ class Container:
             ledger=ledger,
             heartbeats=heartbeats,
             heartbeat_max_gap_seconds=self.settings.heartbeat_max_gap_seconds,
+            exceptions=exceptions,
+            corrections=corrections,
+        )
+        appeal_service = AppealService(
+            cases,
+            evidence,
+            case_events,
+            exceptions,
+            corrections,
+            sessions,
+            policies,
+            ledger,
+            outbox,
+            self.clock,
+            self.ids,
         )
         return Services(
             policy_service=policy_service,
             session_service=session_service,
+            appeal_service=appeal_service,
             heartbeats=heartbeats,
             policies=policies,
             ledger=ledger,

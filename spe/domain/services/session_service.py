@@ -2,19 +2,23 @@
 
 from __future__ import annotations
 
+from collections.abc import Sequence
 from datetime import date, datetime
 
 from spe.domain.clock import Clock
 from spe.domain.events import DomainEvent
+from spe.domain.extensions.appeal_cases import ExceptionGrant
 from spe.domain.ids import IdGenerator
-from spe.domain.policy_ast import PolicyDocument
+from spe.domain.policy_ast import ApprovedException, PolicyDocument, RestrictionKind
 from spe.domain.policy_interpreter import EvalContext, evaluate
 from spe.domain.reason_codes import ReasonCode
 from spe.domain.repositories import (
     DailyUsageLedger,
+    ExceptionGrantRepository,
     HeartbeatSink,
     OutboxRepository,
     PolicyRepository,
+    ProfileCorrectionRepository,
     SessionRepository,
 )
 from spe.domain.services.responses import ActionResult
@@ -24,6 +28,24 @@ from spe.domain.timeutil import age_at, local_day_key, split_watch_window
 
 class ActiveSessionExists(Exception):
     """封装领域状态与业务约束。"""
+
+
+def _document_with_grants(
+    document: PolicyDocument, user_id: str, grants: Sequence[ExceptionGrant]
+) -> PolicyDocument:
+    """把申诉例外合并进策略文档副本，由评估器按既有豁免规则处理。"""
+    merged = document.model_copy(deep=True)
+    merged.rules.exceptions.extend(
+        ApprovedException(
+            exception_id=grant.id,
+            subject_user_id=user_id,
+            waives=grant.kind,
+            approved_by=grant.granted_by,
+            reason="appeal-granted exception",
+        )
+        for grant in grants
+    )
+    return merged
 
 
 class SessionService:
@@ -39,6 +61,8 @@ class SessionService:
         ledger: DailyUsageLedger,
         heartbeats: HeartbeatSink | None = None,
         heartbeat_max_gap_seconds: int = 90,
+        exceptions: ExceptionGrantRepository | None = None,
+        corrections: ProfileCorrectionRepository | None = None,
     ) -> None:
         self._sessions = sessions
         self._policies = policies
@@ -48,6 +72,16 @@ class SessionService:
         self._ledger = ledger
         self._heartbeats = heartbeats
         self._max_gap = heartbeat_max_gap_seconds
+        self._exceptions = exceptions
+        self._corrections = corrections
+
+    async def _active_grants(
+        self, tenant_id: str, user_id: str, now: datetime
+    ) -> list[ExceptionGrant]:
+        """裁决发放且尚未过期的例外；未配置存储时视为没有。"""
+        if self._exceptions is None:
+            return []
+        return list(await self._exceptions.list_active(tenant_id, user_id, now))
 
     # -- start ---------------------------------------------------------------
 
@@ -72,6 +106,14 @@ class SessionService:
 
         now = self._clock.now()
         tz = policy.document.rules.timezone
+
+        # 申诉裁决确认的资料纠正优先于客户端上报的出生日期。
+        birth = birth_date
+        if self._corrections is not None:
+            correction = await self._corrections.get(tenant_id, user_id)
+            if correction is not None:
+                birth = correction.birth_date
+
         # Evaluate eligibility at start against the authoritative daily ledger
         # (age + bedtime + already-consumed daily budget; no session usage yet).
         local_day = local_day_key(now, tz)
@@ -79,11 +121,15 @@ class SessionService:
         ctx = EvalContext(
             now=now,
             user_id=user_id,
-            user_age=age_at(birth_date, now, tz),
+            user_age=age_at(birth, now, tz),
             daily_usage_seconds=daily_used,
             session_elapsed_seconds=0,
         )
-        decision = evaluate(policy.document, ctx)
+        document = policy.document
+        grants = await self._active_grants(tenant_id, user_id, now)
+        if grants:
+            document = _document_with_grants(document, user_id, grants)
+        decision = evaluate(document, ctx)
         if not decision.allowed:
             return ActionResult.rejected(decision.reason, trace=decision.trace)
 
@@ -94,7 +140,7 @@ class SessionService:
             policy_id=policy.id,
             policy_version=policy.version,
             status=SessionStatus.ACTIVE,
-            birth_date=birth_date,
+            birth_date=birth,
             started_at=now,
             updated_at=now,
         )
@@ -148,8 +194,10 @@ class SessionService:
             0, min(watched_seconds_total - session.watched_seconds_marker, self._max_gap)
         )
 
+        grants = await self._active_grants(session.tenant_id, session.user_id, now)
+        waived = frozenset(grant.kind for grant in grants)
         credited, per_day, hit_limit, limit_reason = await self._credit(
-            session, policy.document, tz, now, proposed
+            session, policy.document, tz, now, proposed, waived
         )
 
         # Advance the marker/seq regardless of how much was creditable, so the
@@ -197,6 +245,7 @@ class SessionService:
         timezone: str,
         now: datetime,
         proposed: int,
+        waived: frozenset[RestrictionKind],
     ) -> tuple[int, dict[str, int], bool, str | None]:
         """执行确定性的业务处理。"""
         session_cap = (
@@ -207,6 +256,8 @@ class SessionService:
         daily_cap = (
             document.rules.daily_limit.max_seconds if document.rules.daily_limit else None
         )
+        # 申诉例外豁免每日额度上限；账本仍照常累计，历史用量不受影响。
+        daily_waived = RestrictionKind.DAILY_LIMIT in waived
 
         credited = 0
         per_day: dict[str, int] = {}
@@ -225,7 +276,7 @@ class SessionService:
                     limit_reason = ReasonCode.DENIED_SESSION_LIMIT_REACHED.value
 
             # Bound by remaining daily budget for this specific local day.
-            if daily_cap is not None:
+            if daily_cap is not None and not daily_waived:
                 already = await self._ledger.get_seconds(session.tenant_id, session.user_id, day)
                 day_remaining = daily_cap - (already + per_day.get(day, 0))
                 if allow >= day_remaining:

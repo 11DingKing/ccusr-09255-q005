@@ -1,212 +1,153 @@
-"""服务端业务模块。"""
+"""限制决定申诉的领域模型与状态规则。
+
+用户对年龄、休息时段或每日额度的拒绝决定提出申诉时，系统立案并把
+拒绝决定、固定策略版本、关联会话与证据绑定到同一个案件。客服认领后
+在授权范围内作出一次性裁决：维持原决定、纠正资料，或发放有期限的
+例外。裁决不得篡改历史使用量（每日账本与会话累计保持只读）。
+"""
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field, replace
-from datetime import UTC, datetime, timedelta
+from dataclasses import dataclass
+from datetime import date, datetime, timedelta
 from enum import StrEnum
-from hashlib import sha256
-from typing import Iterable, Mapping, Protocol, Sequence
+from typing import Any
 
+from spe.domain.policy_ast import RestrictionKind
+from spe.domain.reason_codes import ReasonCode
 
-class State(StrEnum):
-    OPENED = "opened"
-    REVIEWING = "reviewing"
-    ACCEPTED = "accepted"
-    CLOSED = "closed"
-
-
-ALLOWED_TRANSITIONS: Mapping[State, frozenset[State]] = {
-    State.OPENED: frozenset({State.REVIEWING, State.ACCEPTED}),
-    State.REVIEWING: frozenset({State.ACCEPTED, State.CLOSED}),
-    State.ACCEPTED: frozenset({State.CLOSED}),
-    State.CLOSED: frozenset({}),
+# 可申诉的拒绝决定 -> 对应的限制类型。其余拒绝（如单次时长）不可申诉。
+APPEALABLE_DENIALS: dict[ReasonCode, RestrictionKind] = {
+    ReasonCode.DENIED_UNDER_MIN_AGE: RestrictionKind.MIN_AGE,
+    ReasonCode.DENIED_BEDTIME_CURFEW: RestrictionKind.BEDTIME,
+    ReasonCode.DENIED_DAILY_LIMIT_REACHED: RestrictionKind.DAILY_LIMIT,
 }
 
+# 例外授权的最长期限，防止客服发放事实上的永久豁免。
+MAX_EXCEPTION_TTL = timedelta(days=30)
 
-class DomainError(ValueError):
-    """封装领域状态与业务约束。"""
+
+class AppealState(StrEnum):
+    """申诉案件的生命周期状态。"""
+
+    OPENED = "opened"
+    """已立案，等待客服认领。"""
+
+    REVIEWING = "reviewing"
+    """已被认领，审核中；只有认领人可以裁决。"""
+
+    RESOLVED = "resolved"
+    """已裁决（一次性）；复开后才允许再次认领与裁决。"""
+
+
+class Verdict(StrEnum):
+    """裁决结论。"""
+
+    UPHOLD = "uphold"
+    """维持原拒绝决定，无副作用。"""
+
+    CORRECT_PROFILE = "correct_profile"
+    """纠正资料（如出生日期），写入权威档案并同步锚定会话。"""
+
+    GRANT_EXCEPTION = "grant_exception"
+    """发放有期限的例外，豁免与申诉限制同类的限制。"""
+
+
+class CaseAction(StrEnum):
+    """写入案件时间线的动作类型。"""
+
+    OPENED = "opened"
+    CLAIMED = "claimed"
+    EVIDENCE_ADDED = "evidence_added"
+    ADJUDICATED = "adjudicated"
+    REOPENED = "reopened"
+
+
+def incident_key(user_id: str, session_id: str | None, denial_reason: ReasonCode) -> str:
+    """同一用户就同一次拒绝事件（会话 + 拒绝原因）只能立一个案件。"""
+    return f"{user_id}|{session_id or '-'}|{denial_reason.value}"
 
 
 @dataclass(frozen=True)
-class AuditEntry:
-    sequence: int
-    action: str
-    actor_id: str
-    occurred_at: datetime
-    before: str
-    after: str
-    reason: str
-    fingerprint: str
+class AppealCase:
+    """申诉案件：拒绝决定、策略版本、会话与证据的固定关联。"""
 
-
-@dataclass(frozen=True)
-class Record:
-    appeal_id: str
-    owner_id: str
-    state: State
+    id: str
+    tenant_id: str
+    user_id: str
+    session_id: str | None
+    denial_reason: ReasonCode
+    policy_id: str
+    policy_version: int
+    snapshot: dict[str, Any]
+    """立案时固定的策略轨迹与评估上下文（评估时间、年龄、当日用量、逐条规则结果）。"""
+    state: AppealState
+    assignee_id: str | None
+    verdict: Verdict | None
+    verdict_reason: str | None
+    correction: dict[str, Any] | None
+    exception_id: str | None
     version: int
     created_at: datetime
     updated_at: datetime
-    expires_at: datetime | None = None
-    attributes: Mapping[str, str] = field(default_factory=dict)
-    audit: tuple[AuditEntry, ...] = ()
+    resolved_at: datetime | None
 
     @property
-    def identifier(self) -> str:
-        return self.appeal_id
-
-    def expired(self, now: datetime) -> bool:
-        return self.expires_at is not None and now >= self.expires_at
+    def restriction_kind(self) -> RestrictionKind:
+        """该案件所申诉的限制类型（授权范围：例外只能豁免这一类）。"""
+        return APPEALABLE_DENIALS[self.denial_reason]
 
 
-class Repository(Protocol):
-    def get(self, identifier: str) -> Record | None: ...
-    def save(self, record: Record, expected_version: int) -> None: ...
-    def list_for_owner(self, owner_id: str) -> Sequence[Record]: ...
+@dataclass(frozen=True)
+class EvidenceItem:
+    """案件证据，只增不改；id 为 0 表示尚未持久化。"""
+
+    id: int
+    tenant_id: str
+    case_id: str
+    label: str
+    detail: str
+    added_by: str
+    added_at: datetime
 
 
-def _utc(value: datetime) -> datetime:
-    if value.tzinfo is None:
-        raise DomainError("时间必须包含时区")
-    return value.astimezone(UTC)
+@dataclass(frozen=True)
+class CaseEvent:
+    """案件时间线条目，只增不改，供解释接口回放。"""
+
+    tenant_id: str
+    case_id: str
+    action: str
+    actor_id: str
+    detail: dict[str, Any]
+    occurred_at: datetime
 
 
-def _fingerprint(identifier: str, version: int, action: str, actor: str, reason: str) -> str:
-    raw = f"{identifier}|{version}|{action}|{actor}|{reason}".encode("utf-8")
-    return sha256(raw).hexdigest()
+@dataclass(frozen=True)
+class ExceptionGrant:
+    """裁决发放的有期限例外，按（租户, 用户, 限制类型）在评估时生效。"""
+
+    id: str
+    tenant_id: str
+    user_id: str
+    kind: RestrictionKind
+    case_id: str
+    granted_by: str
+    reason: str
+    created_at: datetime
+    expires_at: datetime
+
+    def active(self, now: datetime) -> bool:
+        return now < self.expires_at
 
 
-def create_record(
-    identifier: str,
-    owner_id: str,
-    now: datetime,
-    *,
-    ttl: timedelta | None = None,
-    attributes: Mapping[str, str] | None = None,
-) -> Record:
-    identifier = identifier.strip()
-    owner_id = owner_id.strip()
-    if not identifier or not owner_id:
-        raise DomainError("标识和归属方不能为空")
-    instant = _utc(now)
-    expiry = instant + ttl if ttl is not None else None
-    if ttl is not None and ttl <= timedelta(0):
-        raise DomainError("有效期必须大于零")
-    return Record(
-        appeal_id=identifier,
-        owner_id=owner_id,
-        state=State.OPENED,
-        version=1,
-        created_at=instant,
-        updated_at=instant,
-        expires_at=expiry,
-        attributes=dict(attributes or {}),
-    )
+@dataclass(frozen=True)
+class ProfileCorrection:
+    """裁决确认的资料纠正；开播评估以此为准，覆盖客户端上报值。"""
 
-
-def transition(record: Record, target: State, actor_id: str, now: datetime, reason: str) -> Record:
-    instant = _utc(now)
-    actor = actor_id.strip()
-    reason = reason.strip()
-    if not actor or not reason:
-        raise DomainError("状态变更必须记录操作人和原因")
-    if record.expired(instant) and target not in {State.CLOSED}:
-        raise DomainError("已过期记录只能进入终态")
-    if target == record.state:
-        return record
-    if target not in ALLOWED_TRANSITIONS.get(record.state, frozenset()):
-        raise DomainError(f"不允许从 {record.state} 变更到 {target}")
-    next_version = record.version + 1
-    entry = AuditEntry(
-        sequence=len(record.audit) + 1,
-        action="transition",
-        actor_id=actor,
-        occurred_at=instant,
-        before=record.state.value,
-        after=target.value,
-        reason=reason,
-        fingerprint=_fingerprint(record.identifier, next_version, target.value, actor, reason),
-    )
-    return replace(
-        record,
-        state=target,
-        version=next_version,
-        updated_at=instant,
-        audit=record.audit + (entry,),
-    )
-
-
-def patch_attributes(
-    record: Record,
-    changes: Mapping[str, str | None],
-    actor_id: str,
-    now: datetime,
-    reason: str,
-) -> Record:
-    actor = actor_id.strip()
-    note = reason.strip()
-    if not actor or not note:
-        raise DomainError("修改属性必须保留审计说明")
-    merged = dict(record.attributes)
-    for key, value in changes.items():
-        normalized = key.strip()
-        if not normalized:
-            raise DomainError("属性名不能为空")
-        if value is None:
-            merged.pop(normalized, None)
-        else:
-            merged[normalized] = value.strip()
-    instant = _utc(now)
-    next_version = record.version + 1
-    entry = AuditEntry(
-        sequence=len(record.audit) + 1,
-        action="patch",
-        actor_id=actor,
-        occurred_at=instant,
-        before=str(sorted(record.attributes.items())),
-        after=str(sorted(merged.items())),
-        reason=note,
-        fingerprint=_fingerprint(record.identifier, next_version, "patch", actor, note),
-    )
-    return replace(
-        record,
-        attributes=merged,
-        version=next_version,
-        updated_at=instant,
-        audit=record.audit + (entry,),
-    )
-
-
-def verify_audit(record: Record) -> bool:
-    expected = 1
-    seen: set[str] = set()
-    for entry in record.audit:
-        if entry.sequence != expected or entry.fingerprint in seen:
-            return False
-        seen.add(entry.fingerprint)
-        expected += 1
-    return True
-
-
-def latest(records: Iterable[Record]) -> dict[str, Record]:
-    result: dict[str, Record] = {}
-    for record in records:
-        current = result.get(record.identifier)
-        if current is None or (record.version, record.updated_at) > (current.version, current.updated_at):
-            result[record.identifier] = record
-    return result
-
-
-def summarize(records: Iterable[Record], now: datetime) -> dict[str, int]:
-    instant = _utc(now)
-    counts = {state.value: 0 for state in State}
-    counts["expired"] = 0
-    counts["invalid_audit"] = 0
-    for record in latest(records).values():
-        counts[record.state.value] += 1
-        if record.expired(instant):
-            counts["expired"] += 1
-        if not verify_audit(record):
-            counts["invalid_audit"] += 1
-    return counts
+    tenant_id: str
+    user_id: str
+    birth_date: date
+    source_case_id: str
+    corrected_by: str
+    updated_at: datetime

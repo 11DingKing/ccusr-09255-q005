@@ -42,6 +42,14 @@ def get_tenant_id(
     return x_tenant_id
 
 
+def get_agent_id(
+    x_agent_id: Annotated[str, Header(alias="X-Agent-ID")],
+) -> str:
+    """客服身份；申诉案件的认领、补证、裁决与复开都需要。"""
+    return x_agent_id
+
+
 TenantId = Annotated[str, Depends(get_tenant_id)]
+AgentId = Annotated[str, Depends(get_agent_id)]
 Svc = Annotated[Services, Depends(get_services)]
 Db = Annotated[AsyncSession, Depends(get_db)]

@@ -125,3 +125,102 @@ class OutboxModel(Base):
     payload: Mapped[dict] = mapped_column(JSON, nullable=False)
     occurred_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
     published: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
+
+
+class AppealCaseModel(Base):
+    """限制决定申诉案件；incident_key 保证同一拒绝事件只立一案。"""
+
+    __tablename__ = "appeal_cases"
+    __table_args__ = (
+        UniqueConstraint("tenant_id", "incident_key", name="uq_appeal_case_incident"),
+        Index("ix_appeal_cases_tenant_state", "tenant_id", "state"),
+    )
+
+    id: Mapped[str] = mapped_column(String(64), primary_key=True)
+    tenant_id: Mapped[str] = mapped_column(String(64), nullable=False)
+    incident_key: Mapped[str] = mapped_column(String(256), nullable=False)
+    user_id: Mapped[str] = mapped_column(String(64), nullable=False)
+    session_id: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    denial_reason: Mapped[str] = mapped_column(String(64), nullable=False)
+    policy_id: Mapped[str] = mapped_column(String(64), nullable=False)
+    policy_version: Mapped[int] = mapped_column(Integer, nullable=False)
+    snapshot: Mapped[dict] = mapped_column(JSON, nullable=False)
+    state: Mapped[str] = mapped_column(String(16), nullable=False)
+    assignee_id: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    verdict: Mapped[str | None] = mapped_column(String(32), nullable=True)
+    verdict_reason: Mapped[str | None] = mapped_column(String(2000), nullable=True)
+    correction: Mapped[dict | None] = mapped_column(JSON, nullable=True)
+    exception_id: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    version: Mapped[int] = mapped_column(Integer, nullable=False, default=1)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    resolved_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+
+
+class AppealEvidenceModel(Base):
+    """案件证据，只增不改，按自增主键保持提交顺序。"""
+
+    __tablename__ = "appeal_evidence"
+    __table_args__ = (Index("ix_appeal_evidence_case", "tenant_id", "case_id"),)
+
+    id: Mapped[int] = mapped_column(AutoBigInt, primary_key=True, autoincrement=True)
+    tenant_id: Mapped[str] = mapped_column(String(64), nullable=False)
+    case_id: Mapped[str] = mapped_column(String(64), nullable=False)
+    label: Mapped[str] = mapped_column(String(100), nullable=False)
+    detail: Mapped[str] = mapped_column(String(2000), nullable=False)
+    added_by: Mapped[str] = mapped_column(String(64), nullable=False)
+    added_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+
+
+class AppealEventModel(Base):
+    """案件时间线，只增不改。"""
+
+    __tablename__ = "appeal_case_events"
+    __table_args__ = (Index("ix_appeal_events_case", "tenant_id", "case_id"),)
+
+    id: Mapped[int] = mapped_column(AutoBigInt, primary_key=True, autoincrement=True)
+    tenant_id: Mapped[str] = mapped_column(String(64), nullable=False)
+    case_id: Mapped[str] = mapped_column(String(64), nullable=False)
+    action: Mapped[str] = mapped_column(String(32), nullable=False)
+    actor_id: Mapped[str] = mapped_column(String(64), nullable=False)
+    detail: Mapped[dict] = mapped_column(JSON, nullable=False)
+    occurred_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+
+
+class ExceptionGrantModel(Base):
+    """裁决发放的有期限例外。"""
+
+    __tablename__ = "appeal_exceptions"
+    __table_args__ = (
+        Index("ix_appeal_exceptions_user", "tenant_id", "user_id"),
+        Index("ix_appeal_exceptions_case", "tenant_id", "case_id"),
+    )
+
+    id: Mapped[str] = mapped_column(String(64), primary_key=True)
+    tenant_id: Mapped[str] = mapped_column(String(64), nullable=False)
+    user_id: Mapped[str] = mapped_column(String(64), nullable=False)
+    kind: Mapped[str] = mapped_column(String(32), nullable=False)
+    case_id: Mapped[str] = mapped_column(String(64), nullable=False)
+    granted_by: Mapped[str] = mapped_column(String(64), nullable=False)
+    reason: Mapped[str] = mapped_column(String(2000), nullable=False)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    expires_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+
+
+class ProfileCorrectionModel(Base):
+    """裁决确认的资料纠正，按（租户, 用户）唯一。"""
+
+    __tablename__ = "profile_corrections"
+    __table_args__ = (
+        UniqueConstraint("tenant_id", "user_id", name="uq_profile_corrections_user"),
+    )
+
+    id: Mapped[int] = mapped_column(AutoBigInt, primary_key=True, autoincrement=True)
+    tenant_id: Mapped[str] = mapped_column(String(64), nullable=False)
+    user_id: Mapped[str] = mapped_column(String(64), nullable=False)
+    birth_date: Mapped[date] = mapped_column(Date, nullable=False)
+    source_case_id: Mapped[str] = mapped_column(String(64), nullable=False)
+    corrected_by: Mapped[str] = mapped_column(String(64), nullable=False)
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)

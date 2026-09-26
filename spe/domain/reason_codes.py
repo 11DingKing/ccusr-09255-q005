@@ -79,3 +79,22 @@ class ReasonCode(StrEnum):
 
     REJECTED_TENANT_MISMATCH = "REJECTED_TENANT_MISMATCH"
     """The resource belongs to a different tenant than the caller."""
+
+    # --- Rejections: appeal cases ------------------------------------------
+    REJECTED_APPEAL_NOT_FOUND = "REJECTED_APPEAL_NOT_FOUND"
+    """The appeal case does not exist within the caller's tenant."""
+
+    REJECTED_APPEAL_DUPLICATE = "REJECTED_APPEAL_DUPLICATE"
+    """An appeal for the same denial incident already exists; reopen it instead."""
+
+    REJECTED_APPEAL_STATE_CONFLICT = "REJECTED_APPEAL_STATE_CONFLICT"
+    """The case is not in a state that allows the requested transition."""
+
+    REJECTED_APPEAL_FORBIDDEN = "REJECTED_APPEAL_FORBIDDEN"
+    """Only the agent who claimed the case may adjudicate it."""
+
+    REJECTED_APPEAL_NOT_APPEALABLE = "REJECTED_APPEAL_NOT_APPEALABLE"
+    """The denial reason is not one of the appealable restriction decisions."""
+
+    REJECTED_APPEAL_INVALID = "REJECTED_APPEAL_INVALID"
+    """The appeal request is malformed (bad context or verdict payload)."""

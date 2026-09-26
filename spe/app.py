@@ -6,7 +6,7 @@ from contextlib import asynccontextmanager
 
 from fastapi import FastAPI
 
-from spe.api.routes import admin, policies, sessions
+from spe.api.routes import admin, appeals, policies, sessions
 from spe.container import Container
 
 
@@ -28,6 +28,7 @@ def create_app(container: Container | None = None) -> FastAPI:
     )
     app.include_router(policies.router)
     app.include_router(sessions.router)
+    app.include_router(appeals.router)
     app.include_router(admin.router)
     return app
 
